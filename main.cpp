@@ -2,52 +2,36 @@
 #include <openvdb/io/File.h>
 #include <openvdb/tools/GridTransformer.h>
 #include <iostream>
-#include <tira/volume.h>
-#include "tira/image/colormap.h"
-#include "tira/image.h"
+
 #include <openvdb/tools/VolumeToMesh.h>
 #include <openvdb/tools/MeshToVolume.h>
-#include <openvdb/tools/Fastsweeping.h>
+
 #include <openvdb/tools/GridOperators.h>
-#include <openvdb/tools/LevelsetFilter.h>
+
 #include <openvdb/tools/Filter.h>
-#include <openvdb/tools/LevelSetSphere.h>
+
 #include <openvdb/tools/Composite.h>
 #include <openvdb/tools/ChangeBackground.h>
 #include <limits>
 #include <openvdb/tools/Morphology.h> 
 #include <openvdb/tools/GridTransformer.h>
-#include <openvdb/tools/LevelSetUtil.h>
+
 #include <openvdb/tools/ValueTransformer.h>
 #include <cmath>
 #include <openvdb/tools/Interpolation.h>
 #include <openvdb/tools/Morphology.h> 
+#include <omp.h>
+#include <openvdb/tools/Composite.h>
+#include <openvdb/tools/LevelSetRebuild.h> 
 #include <mutex>
 #include <tbb/enumerable_thread_specific.h>
+
 
 
 using namespace openvdb;
 
 
 
-//vdb to image conversion for 3D
-template<class GridType> void vdb2img3D(GridType& grid, tira::volume<float>& img) {
-    using ValueT = typename GridType::ValueType;
-
-    typename GridType::Accessor accessor = grid.getAccessor();
-
-    //openvdb::Coord dim = grid.evalActiveVoxelDim();
-    openvdb::Coord ijk;
-    int& i = ijk[0], & j = ijk[1], & k = ijk[2];
-    for (i = 0; i < img.X(); i++) {
-        for (j = 0; j < img.Y(); j++) {
-            for (k = 0; k < img.Z(); k++) {
-                float pixel = (float)accessor.getValue(ijk);
-                img(i, j, k) = pixel;
-            }
-        }
-    }
-}
 
 openvdb::FloatGrid::Ptr heaviside_return(openvdb::FloatGrid::Ptr& grid, float& backgroundvalue)
 {
@@ -467,7 +451,7 @@ struct Heaviside_Processor {
     using GridType = openvdb::FloatGrid;
     using TreeType = GridType::TreeType;
     using LeafNode = TreeType::LeafNodeType;
-    // splits the iteration space of a leaf iterator
+    // IteratorRange that splits the iteration space of a leaf iterator
     using IterRange = openvdb::tree::IteratorRange<TreeType::LeafCIter>;
 
     float epsilon;
@@ -500,7 +484,7 @@ struct deriv_Heaviside_Processor {
     using GridType = openvdb::FloatGrid;
     using TreeType = GridType::TreeType;
     using LeafNode = TreeType::LeafNodeType;
-    // Isplits the iteration space of a leaf iterator
+    // IteratorRange that splits the iteration space of a leaf iterator
     using IterRange = openvdb::tree::IteratorRange<TreeType::LeafCIter>;
 
     float epsilon;
@@ -535,7 +519,7 @@ struct InverseProcessor {
     using ValueType = typename GridType::ValueType;
     using TreeType = typename GridType::TreeType;
     using LeafNode = typename TreeType::LeafNodeType;
-    // splits the iteration space of a leaf iterator
+    // IteratorRange that splits the iteration space of a leaf iterator
     using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
 
     void operator()(IterRange& range) const {
@@ -543,7 +527,7 @@ struct InverseProcessor {
             auto& leaf = const_cast<LeafNode&>(*range.iterator()); // modifiable leaf node
             for (auto iter = leaf.beginValueOn(); iter; ++iter) {
                 ValueType value = iter.getValue();
-                ValueType inverse_value = 1 - value;  //  inverse of the current value
+                ValueType inverse_value = 1 - value;  // Compute the inverse of the current value
                 leaf.setValueOn(iter.offset(), inverse_value);
             }
         }
@@ -574,11 +558,11 @@ struct GridMultiplier {
 
     void operator()(IterRange& range) const {
         for (; range; ++range) {
-            auto& leaf1 = const_cast<LeafNode&>(*range.iterator());  
+            auto& leaf1 = const_cast<LeafNode&>(*range.iterator());  // Get modifiable leaf node from grid1
             if (const LeafNode* leaf2 = acc2.probeConstLeaf(leaf1.origin())) {  // Match leaf in grid2
                 for (auto iter = leaf1.beginValueOn(); iter; ++iter) {
                     const openvdb::Coord coord = iter.getCoord();
-                    if (leaf2->isValueOn(coord)) {  // if the value is active in grid2
+                    if (leaf2->isValueOn(coord)) {  // Check if the value is active in grid2
                         float value1 = iter.getValue();
                         float value2 = leaf2->getValue(coord);
                         leaf1.setValueOn(iter.offset(), value1 * value2);  // Multiply values
@@ -589,7 +573,7 @@ struct GridMultiplier {
                 }
             }
             else {
-                // no corresponding leaf in grid2
+                // Turn off all values in leaf1 if no corresponding leaf in grid2
                 for (auto iter = leaf1.beginValueOn(); iter; ++iter) {
                     leaf1.setValueOff(iter.offset());
                 }
@@ -700,7 +684,7 @@ struct VoxelProcessor {
             for (auto voxelIter = leaf.beginValueOn(); voxelIter; ++voxelIter) {
                 xyz = voxelIter.getCoord();
                 float s1 = 0.0f, s2 = 0.0f;
-                int sigma1 = 0;  
+                int sigma1 = 0;  // Assuming 'factor' relates to sigma directly
 
                 for (int u = -sigma1; u <= sigma1; ++u) {
                     for (int v = -sigma1; v <= sigma1; ++v) {
@@ -747,13 +731,13 @@ void parallelVoxelComputation(openvdb::FloatGrid::ConstPtr input_grid, openvdb::
         return localGrid;
         });
 
-    // iterator range over leaf nodes
+    // Define iterator range over leaf nodes
     VoxelProcessor::IterRange range(input_grid->tree().cbeginLeaf());
 
-    // tbb 
+    // Perform parallel computation
     tbb::parallel_for(range, VoxelProcessor(input_grid, fout, fin, threadLocalEout, threadLocalEin, factor));
 
-    // merging the thread-local grids 
+    // Merge the thread-local grids into the final output grids
     for (auto& localGrid : threadLocalEout) {
         Eout->tree().merge(localGrid->tree());
     }
@@ -777,14 +761,14 @@ struct GridDivider {
 
     void operator()(IterRange& range) const {
         for (; range; ++range) {
-            auto& leaf1 = const_cast<LeafNode&>(*range.iterator());  // modifiable leaf node from grid1
-            if (const LeafNode* leaf2 = acc2.probeConstLeaf(leaf1.origin())) {  // matching --- leaf in grid2
+            auto& leaf1 = const_cast<LeafNode&>(*range.iterator());  // Get modifiable leaf node from grid1
+            if (const LeafNode* leaf2 = acc2.probeConstLeaf(leaf1.origin())) {  // Match leaf in grid2
                 for (auto iter = leaf1.beginValueOn(); iter; ++iter) {
                     const openvdb::Coord coord = iter.getCoord();
-                    if (leaf2->isValueOn(coord)) {  // if the value is active in grid2
+                    if (leaf2->isValueOn(coord)) {  // Check if the value is active in grid2
                         float value1 = iter.getValue();
                         float value2 = leaf2->getValue(coord);
-                        if (value2 != 0.0f) {  // no division by zero
+                        if (value2 != 0.0f) {  // Ensure no division by zero
                             leaf1.setValueOn(iter.offset(), value1 / value2);  // Divide values
                         }
                         else {
@@ -792,12 +776,12 @@ struct GridDivider {
                         }
                     }
                     else {
-                        leaf1.setValueOff(iter.offset());  // turn off if no corresponding value in grid2
+                        leaf1.setValueOff(iter.offset());  // Optionally turn off if no corresponding value in grid2
                     }
                 }
             }
             else {
-                // if no corresponding leaf in grid2
+                // Turn off all values in leaf1 if no corresponding leaf in grid2
                 for (auto iter = leaf1.beginValueOn(); iter; ++iter) {
                     leaf1.setValueOff(iter.offset());
                 }
@@ -817,7 +801,6 @@ openvdb::FloatGrid::Ptr divideGrids_tbb(openvdb::FloatGrid::Ptr& grid1, openvdb:
 
     return resultGrid;
 }
-
 
 
 //struct GradientXComputer_thread_unsafe {
@@ -869,179 +852,46 @@ struct GradientXComputer {
     using LeafNode = TreeType::LeafNodeType;
     using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
 
-    GridType::ConstPtr inputGrid;  // Using ConstPtr for--- input grid
-    tbb::enumerable_thread_specific<GridType::Ptr>& threadLocalGrids;  // Thread-local grids
-
-    //constructor
-    GradientXComputer(GridType::ConstPtr ig, tbb::enumerable_thread_specific<GridType::Ptr>& tlg)
-        : inputGrid(ig), threadLocalGrids(tlg) {}
-
-    void operator()(IterRange& range) const {
-        auto& gradXGrid = threadLocalGrids.local();
-        GridType::Accessor accessor = gradXGrid->getAccessor();  // local accessor for each thread to write data
-
-        for (; range; ++range) {
-            const LeafNode& leaf = *range.iterator();
-            for (auto iter = leaf.beginValueOn(); iter; ++iter) {
-                const openvdb::Coord xyz = iter.getCoord();
-                float valueLeft = inputGrid->tree().isValueOn(xyz.offsetBy(-1, 0, 0)) ?
-                    inputGrid->tree().getValue(xyz.offsetBy(-1, 0, 0)) : iter.getValue();
-                float valueRight = inputGrid->tree().isValueOn(xyz.offsetBy(1, 0, 0)) ?
-                    inputGrid->tree().getValue(xyz.offsetBy(1, 0, 0)) : iter.getValue();
-                float gradX = (valueRight - valueLeft) / 2.0f;
-
-                accessor.setValueOn(xyz, gradX);  // using local accessor--write 
-            }
-        }
-    }
-};
-
-openvdb::FloatGrid::Ptr calculateGradientX_tbb(const openvdb::FloatGrid::Ptr& grid) {
-    openvdb::FloatGrid::Ptr gradXGrid = openvdb::FloatGrid::create();
-    gradXGrid->setTransform(grid->transform().copy());
-
-    // create thread-local grids
-    tbb::enumerable_thread_specific<openvdb::FloatGrid::Ptr> threadLocalGrids([&]() {
-        auto localGrid = openvdb::FloatGrid::create();
-        localGrid->setTransform(grid->transform().copy());
-        return localGrid;
-        });
-
-    GradientXComputer::IterRange range(grid->tree().cbeginLeaf());
-    GradientXComputer proc(grid, threadLocalGrids);
-
-    tbb::parallel_for(range, proc);
-
-    // merge the thread-local grids into the final output grid
-    for (auto& localGrid : threadLocalGrids) {
-        gradXGrid->tree().merge(localGrid->tree());
-    }
-
-    return gradXGrid;
-}
-
-////////////////////////////delete//////////////////////////////////////
-
-/*
-struct gradcompute {
-    using GridType = openvdb::FloatGrid;
-    using TreeType = GridType::TreeType;
-    using LeafNode = TreeType::LeafNodeType;
-    using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
-
-    GridType::ConstPtr inputgrid;
-    tbb::enumerable_thread_specific<GridType::Ptr>& threadlocalgrids;
-
-    gradcompute(GridType::ConstPtr ig, tbb::enumerable_thread_specific<GridType::Ptr>& tlg)
-        : inputgrid(ig), threadlocalgrids(tlg) {}
-
-    void operator()(IterRange& range)const{
-        auto& resultgrid = threadlocalgrids.local();
-
-
-    }
-
-};
-
-
-
-openvdb::FloatGrid::Ptr test_tbb(const openvdb::FloatGrid::Ptr& grid) {
-    openvdb::FloatGrid::Ptr resultgrid = openvdb::FloatGrid::create();
-
-    resultgrid->setTransform(grid->transform().copy());
-
-    tbb::enumerable_thread_specific<openvdb::FloatGrid::Ptr> threadlocalgrids([&]() {
-        auto localgrid = openvdb::FloatGrid::create();
-        localgrid->setTransform(grid->transform().copy());
-        return localgrid;
-     });
-
-    gradcompute::IterRange range(grid->tree().cbeginLeaf());
-
-    gradcompute proc(grid, threadlocalgrids);
-
-    tbb::parallel_for(range, proc);
-
-    for (auto& localGrid : threadlocalgrids) {
-        resultgrid->tree().merge(localgrid->tree());
-
-    }
-
-}
-
-*/
-
-///////////WITH EXPLANATION///////////
-/*
-
-struct GradientXComputer {
-    using GridType = openvdb::FloatGrid;
-    using TreeType = GridType::TreeType;
-    using LeafNode = TreeType::LeafNodeType;
-    using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
-
     GridType::ConstPtr inputGrid;  // Using ConstPtr for input grid
     tbb::enumerable_thread_specific<GridType::Ptr>& threadLocalGrids;  // Thread-local grids
 
-    // Constructor to initialize the member variables
     GradientXComputer(GridType::ConstPtr ig, tbb::enumerable_thread_specific<GridType::Ptr>& tlg)
         : inputGrid(ig), threadLocalGrids(tlg) {}
 
-    // Operator() to be called for each range of leaf nodes
     void operator()(IterRange& range) const {
-        // Get the thread-local grid for the current thread
         auto& gradXGrid = threadLocalGrids.local();
-        //The tbb::enumerable_thread_specific class provides thread-local storage. Each thread has its own instance of the stored object, and local() is used to access this instance.
-        //threadLocalGrids.local() returns the instance specific to the current thread.
-        // Accessor for modifying the local grid
-        GridType::Accessor accessor = gradXGrid->getAccessor();
+        GridType::Accessor accessor = gradXGrid->getAccessor();  // Local accessor for each thread to write data
 
-        // Iterate over the range of leaf nodes
         for (; range; ++range) {
             const LeafNode& leaf = *range.iterator();
-            // Iterate over the active voxels in the leaf node
             for (auto iter = leaf.beginValueOn(); iter; ++iter) {
                 const openvdb::Coord xyz = iter.getCoord();
-                // Compute the gradient along the X direction
                 float valueLeft = inputGrid->tree().isValueOn(xyz.offsetBy(-1, 0, 0)) ?
                     inputGrid->tree().getValue(xyz.offsetBy(-1, 0, 0)) : iter.getValue();
                 float valueRight = inputGrid->tree().isValueOn(xyz.offsetBy(1, 0, 0)) ?
                     inputGrid->tree().getValue(xyz.offsetBy(1, 0, 0)) : iter.getValue();
                 float gradX = (valueRight - valueLeft) / 2.0f;
 
-                // Set the computed gradient value in the local grid
-                accessor.setValueOn(xyz, gradX);
+                accessor.setValueOn(xyz, gradX);  // Write using local accessor
             }
         }
     }
 };
 
-
 openvdb::FloatGrid::Ptr calculateGradientX_tbb(const openvdb::FloatGrid::Ptr& grid) {
-    // Create a new output grid for the gradient, initially empty
     openvdb::FloatGrid::Ptr gradXGrid = openvdb::FloatGrid::create();
-    // Copy the transform from the input grid to ensure the same spatial mapping
     gradXGrid->setTransform(grid->transform().copy());
 
-    // Create thread-local grids with the same transform as the input grid
-    // The lambda function is called the first time a thread accesses threadLocalGrids.local().
-    // It creates a new FloatGrid, copies the transform from the input grid, and returns the new grid.
-    // []: Captures external variables by reference or value ( & allows capture of external variables by reference).
-    // (): Parameter list (empty because no parameters are needed).
-    
+    // Create thread-local grids
     tbb::enumerable_thread_specific<openvdb::FloatGrid::Ptr> threadLocalGrids([&]() {
         auto localGrid = openvdb::FloatGrid::create();
         localGrid->setTransform(grid->transform().copy());
         return localGrid;
         });
 
-    // Define the range of leaf nodes to be processed
     GradientXComputer::IterRange range(grid->tree().cbeginLeaf());
-
-    // Create an instance of GradientXComputer for processing the leaf nodes
     GradientXComputer proc(grid, threadLocalGrids);
 
-    // Perform parallel processing of the leaf nodes using the proc instance
     tbb::parallel_for(range, proc);
 
     // Merge the thread-local grids into the final output grid
@@ -1049,10 +899,8 @@ openvdb::FloatGrid::Ptr calculateGradientX_tbb(const openvdb::FloatGrid::Ptr& gr
         gradXGrid->tree().merge(localGrid->tree());
     }
 
-    // Return the final output grid containing the computed gradients
     return gradXGrid;
 }
-*/
 
 struct GradientYProcessor {
     using GridType = openvdb::FloatGrid;
@@ -1060,7 +908,7 @@ struct GradientYProcessor {
     using LeafNode = TreeType::LeafNodeType;
     using IterRange = openvdb::tree::IteratorRange<typename TreeType::LeafCIter>;
 
-    GridType::ConstPtr inputGrid;  // Using ConstPtr for input grid [using ConstPtr for the input grid to ensure it remains read-only]
+    GridType::ConstPtr inputGrid;  // Using ConstPtr for input grid
     tbb::enumerable_thread_specific<GridType::Ptr>& threadLocalGrids;  // Thread-local grids
 
     GradientYProcessor(GridType::ConstPtr ig, tbb::enumerable_thread_specific<GridType::Ptr>& tlg)
@@ -1158,7 +1006,7 @@ openvdb::FloatGrid::Ptr calculateGradientZ_tbb(const openvdb::FloatGrid::Ptr& gr
 
     tbb::parallel_for(range, proc);
 
-    // Merge
+    // Merge the thread-local grids into the final output grid
     for (auto& localGrid : threadLocalGrids) {
         gradZGrid->tree().merge(localGrid->tree());
     }
@@ -1183,7 +1031,7 @@ struct GradientMagnitudeComputer {
 
     void operator()(IterRange& range) const {
         auto& gradMagGrid = threadLocalGrids.local();
-        GridType::Accessor accessor = gradMagGrid->getAccessor();  // Local accessor
+        GridType::Accessor accessor = gradMagGrid->getAccessor();  // Local accessor for each thread to write data
 
         auto accessorX = gradXGrid->getConstAccessor();
         auto accessorY = gradYGrid->getConstAccessor();
@@ -1198,7 +1046,7 @@ struct GradientMagnitudeComputer {
                 float gradZ = accessorZ.getValue(xyz);
                 float magnitude = openvdb::math::Sqrt(gradX * gradX + gradY * gradY + gradZ * gradZ);
 
-                accessor.setValueOn(xyz, magnitude);  
+                accessor.setValueOn(xyz, magnitude);  // Write using local accessor
             }
         }
     }
@@ -1225,7 +1073,7 @@ openvdb::FloatGrid::Ptr calculateGradientMagnitude_tbb(
 
     tbb::parallel_for(range, proc);
 
-    // Merge 
+    // Merge the thread-local grids into the final output grid
     for (auto& localGrid : threadLocalGrids) {
         gradMagGrid->tree().merge(localGrid->tree());
     }
@@ -1238,7 +1086,7 @@ int main()
     openvdb::initialize();
 
     // Load sdf grid from file
-    openvdb::io::File file_sdf("C:/3D_vdb/build/3D_200_img_skfm.vdb");
+    openvdb::io::File file_sdf("3D_200_img.vdb");
     file_sdf.open();
     openvdb::GridBase::Ptr baseGrid_sdf;
     for (openvdb::io::File::NameIterator nameIter = file_sdf.beginName(); nameIter != file_sdf.endName(); ++nameIter) {
@@ -1250,7 +1098,7 @@ int main()
     file_sdf.close();
 
     // Load input grid from file
-    openvdb::io::File file_input("C:/3D_vdb/build/3D_200_img.vdb");
+    openvdb::io::File file_input("3D_200_img.vdb");
     file_input.open();
     openvdb::GridBase::Ptr baseGrid_input;
     for (openvdb::io::File::NameIterator nameIter = file_input.beginName(); nameIter != file_input.endName(); ++nameIter) {
@@ -1651,19 +1499,10 @@ int main()
             iter.setValueOff();
         }
     }
-    //exit(1);
-    std::string phi = "C:/openvdb_drop/bin/KESM_2000_863phi.vdb";
-    openvdb::initialize();
-
-    // Create a VDB file object.
-    openvdb::io::File fileEout(phi);
-    fileEout.write({ sdf_grid });
-    //// Close the file. 
-    fileEout.close();
-
-    tira::volume<float> I2(200, 200, 200);
-    vdb2img3D(*sdf_grid, I2); 
-    I2.save_npy("C:/Users/meher/spyder/HD13.npy");
+    
+    openvdb::io::File outFile("sdf_tbb_2000.vdb");
+    outFile.write({ sdf_grid });
+    outFile.close();
 
     return 0;
 }
